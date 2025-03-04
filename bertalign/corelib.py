@@ -2,8 +2,6 @@ import torch
 import faiss
 import numpy as np
 import numba as nb
-from numba import cuda
-from sys import platform
 
 def second_back_track(i, j, pointers, search_path, a_types):
     alignment = []
@@ -335,7 +333,7 @@ def calculate_similarity_score(src_vecs,
     """
     src_v = src_vecs[src_overlap - 1, src_idx - 1, :]
     tgt_v = tgt_vecs[tgt_overlap - 1, tgt_idx - 1, :]
-    similarity = nb_dot(src_v, tgt_v)
+    similarity = np.dot(src_v, tgt_v)
     if margin:
         tgt_neighbor_ave_sim = calculate_neighbor_similarity(src_v, 
                                                              tgt_overlap,
@@ -361,13 +359,13 @@ def calculate_neighbor_similarity(vec, overlap, sent_idx, sent_len, db):
     
     if right_idx <= sent_len:
         right_embed = db[0, right_idx - 1, :]
-        neighbor_right_sim = nb_dot(vec, right_embed)
+        neighbor_right_sim = np.dot(vec, right_embed)
     else:
         neighbor_right_sim = 0
  
     if left_idx > 0:
         left_embed = db[0, left_idx - 1, :]
-        neighbor_left_sim = nb_dot(vec, left_embed)
+        neighbor_left_sim = np.dot(vec, left_embed)
     else:
         neighbor_left_sim = 0
     
@@ -405,10 +403,6 @@ def calculate_length_penalty(src_lens,
     max_len = max(src_l, tgt_l)
     length_penalty = np.log2(1 + min_len / max_len)
     return length_penalty
-
-@nb.jit(nopython=True, fastmath=True, cache=True)
-def nb_dot(x, y):
-    return np.dot(x,y)
 
 def find_second_search_path(align, w, src_len, tgt_len):
     """
