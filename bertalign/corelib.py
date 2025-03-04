@@ -2,6 +2,7 @@ import torch
 import faiss
 import numpy as np
 import numba as nb
+from numba import cuda
 from sys import platform
 
 def second_back_track(i, j, pointers, search_path, a_types):
@@ -52,8 +53,8 @@ def second_pass_align(src_vecs,
     # Intialize cost and backpointer matrix
     src_len = src_vecs.shape[1]
     tgt_len = tgt_vecs.shape[1]
-    cost = np.zeros((src_len + 1, w), dtype=nb.float32)
-    pointers = np.zeros((src_len + 1, w), dtype=nb.uint8)
+    cost = np.zeros((src_len + 1, w), dtype=np.float32)
+    pointers = np.zeros((src_len + 1, w), dtype=np.uint8)
   
     for i in range(src_len + 1):
         i_start = search_path[i][0]
@@ -104,140 +105,81 @@ def second_pass_align(src_vecs,
       
     return pointers
 
-@nb.jit(nopython=True, fastmath=True, cache=True)
-def calculate_similarity_score(src_vecs,
-                               tgt_vecs,
-                               src_idx,
-                               tgt_idx,
-                               src_overlap,
-                               tgt_overlap,
-                               src_len,
-                               tgt_len,
-                               margin=False):
-  
-    """
-    Calulate the semantics-based similarity score of bitext segment.
-    """
-    src_v = src_vecs[src_overlap - 1, src_idx - 1, :]
-    tgt_v = tgt_vecs[tgt_overlap - 1, tgt_idx - 1, :]
-    similarity = nb_dot(src_v, tgt_v)
-    if margin:
-        tgt_neighbor_ave_sim = calculate_neighbor_similarity(src_v, 
-                                                             tgt_overlap,
-                                                             tgt_idx,
-                                                             tgt_len,
-                                                             tgt_vecs)
-    
-        src_neighbor_ave_sim = calculate_neighbor_similarity(tgt_v,
-                                                             src_overlap,
-                                                             src_idx,
-                                                             src_len,
-                                                             src_vecs)
-    
-        neighbor_ave_sim = (tgt_neighbor_ave_sim + src_neighbor_ave_sim) / 2
-        similarity -= neighbor_ave_sim
-
-    return similarity
-
-@nb.jit(nopython=True, fastmath=True, cache=True)
-def calculate_neighbor_similarity(vec, overlap, sent_idx, sent_len, db):
-    left_idx = sent_idx - overlap
-    right_idx = sent_idx + 1
-    
-    if right_idx <= sent_len:
-        right_embed = db[0, right_idx - 1, :]
-        neighbor_right_sim = nb_dot(vec, right_embed)
-    else:
-        neighbor_right_sim = 0
- 
-    if left_idx > 0:
-        left_embed = db[0, left_idx - 1, :]
-        neighbor_left_sim = nb_dot(vec, left_embed)
-    else:
-        neighbor_left_sim = 0
-    
-    neighbor_ave_sim = neighbor_left_sim + neighbor_right_sim
-    if neighbor_right_sim and neighbor_left_sim:
-        neighbor_ave_sim /= 2
-    
-    return neighbor_ave_sim
-
-@nb.jit(nopython=True, fastmath=True, cache=True)
-def calculate_length_penalty(src_lens,
-                             tgt_lens,
-                             src_idx,
-                             tgt_idx,
-                             src_overlap,
-                             tgt_overlap,
-                             char_ratio):
-    """
-    Calculate the length-based similarity score of bitext segment.
-    Args:
-        src_lens: numpy array. Source sentence lengths vector.
-        tgt_lens: numpy array. Target sentence lengths vector.
-        src_idx: int. Source sentence index.
-        tgt_idx: int. Target sentence index.
-        src_overlap: int. Number of sentences in source segment.
-        tgt_overlap: int. Number of sentences in target segment.
-        char_ratio: float. Source to target sentence length ratio.
-    Returns:
-        length_penalty: float. Similarity score based on length differences.
-    """
-    src_l = src_lens[src_overlap - 1, src_idx - 1]
-    tgt_l = tgt_lens[tgt_overlap - 1, tgt_idx - 1]
-    tgt_l = tgt_l * char_ratio
-    min_len = min(src_l, tgt_l)
-    max_len = max(src_l, tgt_l)
-    length_penalty = np.log2(1 + min_len / max_len)
-    return length_penalty
-
-@nb.jit(nopython=True, fastmath=True, cache=True)
-def nb_dot(x, y):
-    return np.dot(x,y)
-
-def find_second_search_path(align, w, src_len, tgt_len):
-    """
-    Convert 1-1 first-pass alignment to the second-round path.
-    The indices along X-axis and Y-axis must be consecutive.
-    Args:
-        align: list of tuples. First-pass alignment results.
-        w: int. Predefined window size for the second path.
-        src_len: int. Number of source sentences.
-        tgt_len: int. Number of target sentences.
-    Returns:
-        path: numpy array. Search path for the second-pass alignment.
-    """
-    # Ajust the first-alignment result
-    # so that the last bead is (src_len, tgt_len).
-    last_bead_src = align[-1][0]
-    last_bead_tgt = align[-1][1]
-    if last_bead_src != src_len:
-        if last_bead_tgt == tgt_len:
-            align.pop()
-        align.append((src_len, tgt_len))
-    else:
-        if last_bead_tgt != tgt_len:
-            align.pop()
-            align.append((src_len, tgt_len))
-    
-    """
-    Find the search path for each row.
-    """
-    prev_src, prev_tgt = 0, 0
-    path = []
-    max_w = -np.inf
-    for src, tgt in align:
-        # Limit the search path in a rectangle with the width
-        # along the Y axis being (upper_bound - lower_bound).
-        lower_bound = max(0, prev_tgt - w)
-        upper_bound = min(tgt_len, tgt + w)
-        path.extend([(lower_bound, upper_bound) for id in range(prev_src+1, src+1)])
-        prev_src, prev_tgt = src, tgt
-        width = upper_bound - lower_bound
-        if width > max_w:
-            max_w = width
-    path = [path[0]] + path # add the search path for row 0
-    return max_w + 1, np.array(path)
+def find_top_k_sents(src_vecs, tgt_vecs, k=3):
+    try:
+        embedding_size = src_vecs.shape[1]
+        print(f"Creating FAISS index with embedding size: {embedding_size}")
+        
+        # Check if faiss has GPU capabilities
+        has_gpu = hasattr(faiss, 'StandardGpuResources')
+        
+        if has_gpu:
+            try:
+                # Initialize GPU resources with more configuration
+                res = faiss.StandardGpuResources()
+                print("GPU resources initialized successfully with custom configuration")
+                
+                # Create and transfer index to GPU with correct function signature
+                index = faiss.IndexFlatIP(embedding_size)
+                gpu_index = faiss.index_cpu_to_gpu(res, 0, index)  
+                print(f"Index transferred to GPU (device 0)")
+                
+                # Convert vectors to contiguous numpy arrays if needed
+                if not src_vecs.flags.c_contiguous:
+                    src_vecs = np.ascontiguousarray(src_vecs)
+                    print("Converted source vectors to contiguous array")
+                if not tgt_vecs.flags.c_contiguous:
+                    tgt_vecs = np.ascontiguousarray(tgt_vecs)
+                    print("Converted target vectors to contiguous array")
+                
+                # Add target vectors to index in batches for better GPU utilization
+                batch_size = min(1024, tgt_vecs.shape[0])
+                for i in range(0, tgt_vecs.shape[0], batch_size):
+                    end_idx = min(i + batch_size, tgt_vecs.shape[0])
+                    gpu_index.add(tgt_vecs[i:end_idx])
+                    print(f"Added batch {i//batch_size + 1} ({end_idx-i} vectors) to GPU index")
+                
+                # Search for nearest neighbors in batches
+                batch_size = min(1024, src_vecs.shape[0])
+                D_list = []
+                I_list = []
+                
+                print(f"Beginning search with {src_vecs.shape[0]} vectors in batches of {batch_size}")
+                for i in range(0, src_vecs.shape[0], batch_size):
+                    end_idx = min(i + batch_size, src_vecs.shape[0])
+                    batch_D, batch_I = gpu_index.search(src_vecs[i:end_idx], k)
+                    D_list.append(batch_D)
+                    I_list.append(batch_I)
+                    print(f"Completed batch {i//batch_size + 1} search ({end_idx-i} vectors)")
+                
+                # Combine batch results
+                if len(D_list) > 1:
+                    D = np.vstack(D_list)
+                    I = np.vstack(I_list)
+                else:
+                    D = D_list[0]
+                    I = I_list[0]
+                
+                print("GPU search completed successfully")
+                return D, I
+            except Exception as e:
+                print(f"GPU initialization failed: {str(e)}")
+                print("Falling back to CPU")
+        else:
+            print("GPU support not available in FAISS")
+            print("Falling back to CPU")
+        
+        # CPU fallback
+        index = faiss.IndexFlatIP(embedding_size)
+        index.add(tgt_vecs)
+        print(f"Added {tgt_vecs.shape[0]} vectors to CPU index")
+        D, I = index.search(src_vecs, k)
+        print("CPU search completed")
+        return D, I
+            
+    except Exception as e:
+        print(f"Critical error in find_top_k_sents: {e}")
+        raise
 
 def first_back_track(i, j, pointers, search_path, a_types):
     """
@@ -377,48 +319,137 @@ def get_alignment_types(max_alignment_size):
                 alignment_types.append([x, y])    
     return np.array(alignment_types)
 
-def find_top_k_sents(src_vecs, tgt_vecs, k=3):
-    try:
-        embedding_size = src_vecs.shape[1]
-        print(f"Creating FAISS index with embedding size: {embedding_size}")
-        
-        # Check if faiss has GPU capabilities
-        has_gpu = hasattr(faiss, 'StandardGpuResources')
-        
-        if has_gpu:
-            try:
-                # Initialize GPU resources
-                res = faiss.StandardGpuResources()
-                print("GPU resources initialized successfully")
-                
-                # Create and transfer index to GPU
-                index = faiss.IndexFlatIP(embedding_size)
-                gpu_index = faiss.index_cpu_to_gpu(res, 0, index)
-                print("Index transferred to GPU")
-                
-                # Add target vectors to index
-                gpu_index.add(tgt_vecs)
-                print(f"Added {tgt_vecs.shape[0]} vectors to GPU index")
-                
-                # Search for nearest neighbors
-                D, I = gpu_index.search(src_vecs, k)
-                print("GPU search completed")
-                return D, I
-            except Exception as e:
-                print(f"GPU initialization failed: {str(e)}")
-                print("Falling back to CPU")
-        else:
-            print("GPU support not available in FAISS")
-            print("Falling back to CPU")
-        
-        # CPU fallback
-        index = faiss.IndexFlatIP(embedding_size)
-        index.add(tgt_vecs)
-        print(f"Added {tgt_vecs.shape[0]} vectors to CPU index")
-        D, I = index.search(src_vecs, k)
-        print("CPU search completed")
-        return D, I
-            
-    except Exception as e:
-        print(f"Critical error in find_top_k_sents: {e}")
-        raise
+@nb.jit(nopython=True, fastmath=True, cache=True)
+def calculate_similarity_score(src_vecs,
+                               tgt_vecs,
+                               src_idx,
+                               tgt_idx,
+                               src_overlap,
+                               tgt_overlap,
+                               src_len,
+                               tgt_len,
+                               margin=False):
+  
+    """
+    Calulate the semantics-based similarity score of bitext segment.
+    """
+    src_v = src_vecs[src_overlap - 1, src_idx - 1, :]
+    tgt_v = tgt_vecs[tgt_overlap - 1, tgt_idx - 1, :]
+    similarity = nb_dot(src_v, tgt_v)
+    if margin:
+        tgt_neighbor_ave_sim = calculate_neighbor_similarity(src_v, 
+                                                             tgt_overlap,
+                                                             tgt_idx,
+                                                             tgt_len,
+                                                             tgt_vecs)
+    
+        src_neighbor_ave_sim = calculate_neighbor_similarity(tgt_v,
+                                                             src_overlap,
+                                                             src_idx,
+                                                             src_len,
+                                                             src_vecs)
+    
+        neighbor_ave_sim = (tgt_neighbor_ave_sim + src_neighbor_ave_sim) / 2
+        similarity -= neighbor_ave_sim
+
+    return similarity
+
+@nb.jit(nopython=True, fastmath=True, cache=True)
+def calculate_neighbor_similarity(vec, overlap, sent_idx, sent_len, db):
+    left_idx = sent_idx - overlap
+    right_idx = sent_idx + 1
+    
+    if right_idx <= sent_len:
+        right_embed = db[0, right_idx - 1, :]
+        neighbor_right_sim = nb_dot(vec, right_embed)
+    else:
+        neighbor_right_sim = 0
+ 
+    if left_idx > 0:
+        left_embed = db[0, left_idx - 1, :]
+        neighbor_left_sim = nb_dot(vec, left_embed)
+    else:
+        neighbor_left_sim = 0
+    
+    neighbor_ave_sim = neighbor_left_sim + neighbor_right_sim
+    if neighbor_right_sim and neighbor_left_sim:
+        neighbor_ave_sim /= 2
+    
+    return neighbor_ave_sim
+
+@nb.jit(nopython=True, fastmath=True, cache=True)
+def calculate_length_penalty(src_lens,
+                             tgt_lens,
+                             src_idx,
+                             tgt_idx,
+                             src_overlap,
+                             tgt_overlap,
+                             char_ratio):
+    """
+    Calculate the length-based similarity score of bitext segment.
+    Args:
+        src_lens: numpy array. Source sentence lengths vector.
+        tgt_lens: numpy array. Target sentence lengths vector.
+        src_idx: int. Source sentence index.
+        tgt_idx: int. Target sentence index.
+        src_overlap: int. Number of sentences in source segment.
+        tgt_overlap: int. Number of sentences in target segment.
+        char_ratio: float. Source to target sentence length ratio.
+    Returns:
+        length_penalty: float. Similarity score based on length differences.
+    """
+    src_l = src_lens[src_overlap - 1, src_idx - 1]
+    tgt_l = tgt_lens[tgt_overlap - 1, tgt_idx - 1]
+    tgt_l = tgt_l * char_ratio
+    min_len = min(src_l, tgt_l)
+    max_len = max(src_l, tgt_l)
+    length_penalty = np.log2(1 + min_len / max_len)
+    return length_penalty
+
+@nb.jit(nopython=True, fastmath=True, cache=True)
+def nb_dot(x, y):
+    return np.dot(x,y)
+
+def find_second_search_path(align, w, src_len, tgt_len):
+    """
+    Convert 1-1 first-pass alignment to the second-round path.
+    The indices along X-axis and Y-axis must be consecutive.
+    Args:
+        align: list of tuples. First-pass alignment results.
+        w: int. Predefined window size for the second path.
+        src_len: int. Number of source sentences.
+        tgt_len: int. Number of target sentences.
+    Returns:
+        path: numpy array. Search path for the second-pass alignment.
+    """
+    # Ajust the first-alignment result
+    # so that the last bead is (src_len, tgt_len).
+    last_bead_src = align[-1][0]
+    last_bead_tgt = align[-1][1]
+    if last_bead_src != src_len:
+        if last_bead_tgt == tgt_len:
+            align.pop()
+        align.append((src_len, tgt_len))
+    else:
+        if last_bead_tgt != tgt_len:
+            align.pop()
+            align.append((src_len, tgt_len))
+    
+    """
+    Find the search path for each row.
+    """
+    prev_src, prev_tgt = 0, 0
+    path = []
+    max_w = -np.inf
+    for src, tgt in align:
+        # Limit the search path in a rectangle with the width
+        # along the Y axis being (upper_bound - lower_bound).
+        lower_bound = max(0, prev_tgt - w)
+        upper_bound = min(tgt_len, tgt + w)
+        path.extend([(lower_bound, upper_bound) for id in range(prev_src+1, src+1)])
+        prev_src, prev_tgt = src, tgt
+        width = upper_bound - lower_bound
+        if width > max_w:
+            max_w = width
+    path = [path[0]] + path # add the search path for row 0
+    return max_w + 1, np.array(path)
